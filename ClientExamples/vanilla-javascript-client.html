@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Payment Processing Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #555;
+        }
+        input {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        #status-container {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #f9f9f9;
+            border-radius: 4px;
+            min-height: 100px;
+        }
+        .status-item {
+            padding: 8px;
+            margin: 5px 0;
+            border-left: 4px solid #4CAF50;
+            background-color: white;
+        }
+        .status-queued { border-left-color: #2196F3; }
+        .status-processing { border-left-color: #FF9800; }
+        .status-sendingtoprocessor { border-left-color: #9C27B0; }
+        .status-completed { border-left-color: #4CAF50; }
+        .status-failed { border-left-color: #F44336; }
+        .error {
+            color: #F44336;
+            font-weight: bold;
+        }
+        .payment-id {
+            font-family: monospace;
+            background-color: #f0f0f0;
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Payment Processing Demo</h1>
+        <p>This demonstrates Server-Sent Events (SSE) for real-time payment status updates.</p>
+        
+        <div class="form-group">
+            <label for="amount">Amount ($):</label>
+            <input type="number" id="amount" step="0.01" value="99.99" min="0.01">
+        </div>
+        
+        <div class="form-group">
+            <label for="cardToken">Card Token:</label>
+            <input type="text" id="cardToken" value="tok_demo_123456" 
+                   placeholder="In production, this would be from Stripe/etc">
+        </div>
+        
+        <div class="form-group">
+            <label for="email">Customer Email (optional):</label>
+            <input type="email" id="email" value="customer@example.com">
+        </div>
+        
+        <button id="processBtn" onclick="processPayment()">Process Payment</button>
+        <button id="cancelBtn" onclick="cancelPayment()" style="display:none; background-color:#F44336;">
+            Cancel Payment
+        </button>
+        
+        <div id="status-container"></div>
+    </div>
+
+    <script>
+        let eventSource = null;
+        const API_URL = 'https://localhost:7000/api/payment'; // Update port as needed
+
+        function processPayment() {
+            const amount = parseFloat(document.getElementById('amount').value);
+            const cardToken = document.getElementById('cardToken').value;
+            const email = document.getElementById('email').value;
+            
+            if (!amount || amount <= 0) {
+                alert('Please enter a valid amount');
+                return;
+            }
+            
+            if (!cardToken) {
+                alert('Please enter a card token');
+                return;
+            }
+
+            const statusContainer = document.getElementById('status-container');
+            statusContainer.innerHTML = '<h3>Connecting to payment service...</h3>';
+            
+            document.getElementById('processBtn').disabled = true;
+            document.getElementById('cancelBtn').style.display = 'inline-block';
+            
+            // Show connecting message if no response after 2 seconds
+            const connectingTimeout = setTimeout(() => {
+                if (statusContainer.innerHTML.includes('Connecting')) {
+                    statusContainer.innerHTML = '<h3>Connecting to payment service...</h3><p style="color:#FF9800;">Waiting for server response...</p>';
+                }
+            }, 2000);
+
+            // Track if we've received any data (to detect timeouts)
+            let hasReceivedData = false;
+            let lastDataTime = Date.now();
+            const TIMEOUT_MS = 30000; // 30 second timeout
+            let timeoutId = null;
+            
+            // Make POST request to start payment
+            fetch(`${API_URL}/process`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    amount: amount,
+                    cardToken: cardToken,
+                    customerEmail: email || null
+                })
+            })
+            .then(response => {
+                clearTimeout(connectingTimeout);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                if (!response.body) {
+                    throw new Error('Response body is null - cannot read stream');
+                }
+                
+                console.log('Response received, starting to read stream...');
+                
+                // Set up SSE stream
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                
+                // Set up timeout detection
+                timeoutId = setInterval(() => {
+                    const timeSinceLastData = Date.now() - lastDataTime;
+                    if (hasReceivedData && timeSinceLastData > TIMEOUT_MS) {
+                        console.error('Stream timeout - no data received for', timeSinceLastData, 'ms');
+                        reader.cancel();
+                        clearInterval(timeoutId);
+                        statusContainer.innerHTML += `<p class="error">Connection timeout - no updates received for ${Math.round(timeSinceLastData/1000)} seconds</p>`;
+                        onStreamComplete();
+                    }
+                }, 1000);
+                
+                function readStream() {
+                    reader.read().then(({ done, value }) => {
+                        if (done) {
+                            console.log('Stream complete');
+                            if (timeoutId) clearInterval(timeoutId);
+                            onStreamComplete();
+                            return;
+                        }
+                        
+                        hasReceivedData = true;
+                        lastDataTime = Date.now();
+                        
+                        // Decode the chunk (stream: true allows partial UTF-8 sequences)
+                        const chunk = decoder.decode(value, { stream: true });
+                        const lines = chunk.split('\n');
+                        
+                        for (let line of lines) {
+                            if (line.startsWith('data: ')) {
+                                const data = line.substring(6).trim();
+                                if (data) {
+                                    try {
+                                        const status = JSON.parse(data);
+                                        displayStatus(status);
+                                    } catch (e) {
+                                        console.error('Error parsing JSON:', e, 'Data:', data);
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Continue reading
+                        readStream();
+                    }).catch(error => {
+                        console.error('Stream error:', error);
+                        if (timeoutId) clearInterval(timeoutId);
+                        onStreamError(error);
+                    });
+                }
+                
+                readStream();
+            })
+            .catch(error => {
+                clearTimeout(connectingTimeout);
+                console.error('Error:', error);
+                if (timeoutId) clearInterval(timeoutId);
+                statusContainer.innerHTML = `<h3>Error</h3><p class="error">Error: ${error.message}</p>`;
+                onStreamComplete();
+            });
+        }
+
+        function displayStatus(status) {
+            const statusContainer = document.getElementById('status-container');
+            
+            // Show payment ID on first message (initial response)
+            if (status.paymentId && !status.status) {
+                statusContainer.innerHTML = `
+                    <h3>Payment ID: <span class="payment-id">${status.paymentId}</span></h3>
+                    <p>${status.message || 'Payment request received'}</p>
+                `;
+                return;
+            }
+            
+            // Validate status object has required fields
+            if (status.status === undefined || status.status === null || !status.message) {
+                console.warn('Invalid status object (missing status or message):', status);
+                return;
+            }
+            
+            // Convert enum to string if it's a number
+            // Enum values: 0=Queued, 1=Processing, 2=SendingToProcessor, 3=Completed, 4=Failed
+            const statusEnumMap = {
+                0: 'Queued',
+                1: 'Processing',
+                2: 'SendingToProcessor',
+                3: 'Completed',
+                4: 'Failed'
+            };
+            
+            let statusString = status.status;
+            if (typeof status.status === 'number') {
+                statusString = statusEnumMap[status.status] || `Status${status.status}`;
+            }
+            
+            // Safely format timestamp
+            let timestamp = '';
+            try {
+                if (status.timestamp) {
+                    const date = new Date(status.timestamp);
+                    if (!isNaN(date.getTime())) {
+                        timestamp = date.toLocaleTimeString();
+                    }
+                }
+            } catch (e) {
+                console.warn('Invalid timestamp:', status.timestamp, e);
+                // Continue without timestamp
+            }
+            
+            const statusClass = statusString.toLowerCase();
+            
+            const statusItem = document.createElement('div');
+            statusItem.className = `status-item status-${statusClass}`;
+            statusItem.innerHTML = `
+                <strong>${statusString}:</strong> ${status.message}
+                ${timestamp ? `<span style="float:right; color:#888;">${timestamp}</span>` : ''}
+            `;
+            
+            statusContainer.appendChild(statusItem);
+            
+            // Check if terminal state (handle both string and number)
+            if (statusString === 'Completed' || statusString === 'Failed' || 
+                status.status === 3 || status.status === 4) {
+                onStreamComplete();
+            }
+        }
+
+        function cancelPayment() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            
+            const statusContainer = document.getElementById('status-container');
+            statusContainer.innerHTML += '<p class="error">Payment cancelled by user</p>';
+            
+            onStreamComplete();
+        }
+
+        function onStreamComplete() {
+            document.getElementById('processBtn').disabled = false;
+            document.getElementById('cancelBtn').style.display = 'none';
+        }
+
+        function onStreamError(error) {
+            document.getElementById('status-container').innerHTML += 
+                `<p class="error">Connection error: ${error.message}</p>`;
+            onStreamComplete();
+        }
+    </script>
+</body>
+</html>
+

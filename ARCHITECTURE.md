@@ -407,11 +407,129 @@ var processorOptions = new ServiceBusProcessorOptions
 ```
 
 ### How It Works
+
+**Where It's Configured**: In `PaymentServiceBusService.cs` when creating the `ServiceBusProcessor`.
+
+**Where It's Enforced**: Inside the `ServiceBusProcessor` class from the Azure SDK (not in your code). The processor internally manages concurrency.
+
+**How It Works**:
 - **ServiceBusProcessor automatically limits** concurrent message handlers to 5
 - No manual semaphore needed - built into the processor
 - When MaxConcurrentCalls=5, only 5 messages are processed concurrently
 - Additional messages wait in the Service Bus queue until a slot is available
 - Message locking prevents duplicate processing across multiple servers
+
+### Example: 100 Messages with MaxConcurrentCalls = 5
+
+```
+Time    Messages in Queue    Active Handlers    What Happens
+─────────────────────────────────────────────────────────────────
+T+0s    100 messages         0                  Processor starts
+T+0s    100 messages         5                  First 5 handlers start
+                                                  (MaxConcurrentCalls = 5)
+T+1s    95 messages          5                  Processing 5 payments
+                                                  (95 messages waiting in queue)
+T+8s    95 messages          4                  One payment completes
+                                                  Handler #1 finishes
+T+8s    94 messages          5                  Processor immediately starts
+                                                  handler #6 (slot freed)
+T+16s   90 messages          4                  Another payment completes
+                                                  Handler #2 finishes
+T+16s   89 messages          5                  Processor starts handler #7
+...     ...                  ...                Continues until all 100 done
+T+160s  0 messages           0                  All 100 payments processed
+                                                  (20 batches of 5)
+```
+
+### Visual Flow
+
+```
+Service Bus Queue (100 messages)
+    │
+    ├─ Message 1 ──► [Handler 1] ──► Processing...
+    ├─ Message 2 ──► [Handler 2] ──► Processing...
+    ├─ Message 3 ──► [Handler 3] ──► Processing...
+    ├─ Message 4 ──► [Handler 4] ──► Processing...
+    ├─ Message 5 ──► [Handler 5] ──► Processing...
+    │
+    ├─ Message 6 ──► [WAITING - MaxConcurrentCalls = 5]
+    ├─ Message 7 ──► [WAITING]
+    ├─ ...
+    └─ Message 100 ─► [WAITING]
+    
+When Handler 1 completes:
+    Message 6 ──► [Handler 6] ──► Processing...
+    (Handler 1 slot freed, Handler 6 starts immediately)
+```
+
+### Internal Mechanism (Azure SDK)
+
+The `ServiceBusProcessor` from the Azure SDK internally manages concurrency similar to this (simplified):
+
+```csharp
+// Inside ServiceBusProcessor (Azure SDK code, not yours)
+private int _activeHandlerCount = 0;
+private readonly SemaphoreSlim _concurrencySemaphore;
+
+// When StartProcessingAsync() is called:
+while (!cancellationToken.IsCancellationRequested)
+{
+    // Wait if we're at max concurrent calls
+    await _concurrencySemaphore.WaitAsync();
+    
+    // Receive message from Service Bus
+    var message = await ReceiveMessageAsync();
+    
+    // Increment active count
+    Interlocked.Increment(ref _activeHandlerCount);
+    
+    // Fire your handler (but don't await it - fire and forget)
+    _ = Task.Run(async () =>
+    {
+        try
+        {
+            await ProcessMessageAsync?.Invoke(args);  // Your handler
+        }
+        finally
+        {
+            // Decrement and release semaphore when done
+            Interlocked.Decrement(ref _activeHandlerCount);
+            _concurrencySemaphore.Release();  // Frees slot for next message
+        }
+    });
+}
+```
+
+**Key Points**:
+- The limiting happens **inside the Azure SDK**, not in your code
+- Messages stay in the Service Bus queue until a handler slot is available
+- No manual semaphore needed - the processor manages it automatically
+- FIFO order is maintained - messages are processed in order
+
+### Comparison: Old Semaphore vs. Service Bus MaxConcurrentCalls
+
+**Old Approach (SemaphoreSlim):**
+```csharp
+// Your code had to manage this:
+await _semaphore.WaitAsync();  // Your code controls this
+try {
+    await ProcessPaymentAsync(...);
+} finally {
+    _semaphore.Release();  // Your code controls this
+}
+```
+
+**New Approach (ServiceBusProcessor):**
+```csharp
+// ServiceBusProcessor manages this internally:
+processor.ProcessMessageAsync += async args => {
+    // This handler is only called when a slot is available
+    // The processor tracks: "How many handlers are running?"
+    // If count >= MaxConcurrentCalls, it waits
+    await ProcessServiceBusMessageAsync(args, stoppingToken);
+    // When this completes, processor automatically starts next handler
+};
+```
 
 ### Why 5 Concurrent?
 - Third-party processor limits

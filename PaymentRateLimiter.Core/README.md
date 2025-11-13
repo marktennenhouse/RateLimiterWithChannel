@@ -312,12 +312,105 @@ public async Task ProcessPaymentStream([FromBody] PaymentRequestDto dto)
 ## Features
 
 - ✅ **Azure Service Bus Integration**: Persistent queue, scales across servers
-- ✅ **Rate Limiting**: MaxConcurrentCalls (default: 5, configurable)
+- ✅ **Rate Limiting**: MaxConcurrentCalls (default: 5, configurable) - automatically enforced by ServiceBusProcessor
 - ✅ **Real-Time Status Updates**: Subscribe via channels
 - ✅ **Client Disconnection Handling**: Prevents processing abandoned payments
 - ✅ **Thread-Safe**: Safe for concurrent use
 - ✅ **Automatic Cleanup**: Service Bus handles message lifecycle
 - ✅ **Monitoring**: GetStatistics() for active/disconnected/total counts
+
+## How Rate Limiting Works (MaxConcurrentCalls)
+
+### Overview
+
+The `MaxConcurrentCalls` setting controls how many payment messages are processed simultaneously. This limit is **automatically enforced by the ServiceBusProcessor** from the Azure SDK - you don't need to manage it manually.
+
+### Configuration
+
+```csharp
+// In PaymentServiceBusService.cs
+var processorOptions = new ServiceBusProcessorOptions
+{
+    MaxConcurrentCalls = 5,  // Only 5 messages processed at once
+    AutoCompleteMessages = false
+};
+```
+
+### Example: 100 Messages with MaxConcurrentCalls = 5
+
+When 100 payment requests are in the Service Bus queue:
+
+```
+Time    Messages in Queue    Active Handlers    What Happens
+─────────────────────────────────────────────────────────────────
+T+0s    100 messages         0                  Processor starts
+T+0s    100 messages         5                  First 5 handlers start
+                                                  (MaxConcurrentCalls = 5)
+T+1s    95 messages          5                  Processing 5 payments
+                                                  (95 messages waiting in queue)
+T+8s    95 messages          4                  One payment completes
+                                                  Handler #1 finishes
+T+8s    94 messages          5                  Processor immediately starts
+                                                  handler #6 (slot freed)
+T+16s   90 messages          4                  Another payment completes
+                                                  Handler #2 finishes
+T+16s   89 messages          5                  Processor starts handler #7
+...     ...                  ...                Continues until all 100 done
+T+160s  0 messages           0                  All 100 payments processed
+                                                  (20 batches of 5)
+```
+
+### How It Works Internally
+
+The `ServiceBusProcessor` from the Azure SDK internally manages concurrency:
+
+1. **Receives messages** from Service Bus queue
+2. **Tracks active handlers** - counts how many `ProcessMessageAsync` handlers are currently running
+3. **Enforces limit** - only invokes your handler when count < MaxConcurrentCalls
+4. **Waits for completion** - when a handler finishes, it automatically starts the next one
+
+**Key Points**:
+- The limiting happens **inside the Azure SDK**, not in your code
+- Messages stay in the Service Bus queue until a handler slot is available
+- No manual semaphore needed - the processor manages it automatically
+- FIFO order is maintained - messages are processed in order
+
+### Visual Flow
+
+```
+Service Bus Queue (100 messages)
+    │
+    ├─ Message 1 ──► [Handler 1] ──► Processing...
+    ├─ Message 2 ──► [Handler 2] ──► Processing...
+    ├─ Message 3 ──► [Handler 3] ──► Processing...
+    ├─ Message 4 ──► [Handler 4] ──► Processing...
+    ├─ Message 5 ──► [Handler 5] ──► Processing...
+    │
+    ├─ Message 6 ──► [WAITING - MaxConcurrentCalls = 5]
+    ├─ Message 7 ──► [WAITING]
+    ├─ ...
+    └─ Message 100 ─► [WAITING]
+    
+When Handler 1 completes:
+    Message 6 ──► [Handler 6] ──► Processing...
+    (Handler 1 slot freed, Handler 6 starts immediately)
+```
+
+### Your Code
+
+In your code, you simply register the handler:
+
+```csharp
+processor.ProcessMessageAsync += async args => {
+    // This handler is only called when a slot is available
+    // The processor automatically manages: "How many handlers are running?"
+    // If count >= MaxConcurrentCalls, it waits before calling this
+    await ProcessServiceBusMessageAsync(args, stoppingToken);
+    // When this completes, processor automatically starts next handler
+};
+```
+
+You don't need to manage semaphores or thread counts - the processor does it for you!
 
 ## Dependencies
 

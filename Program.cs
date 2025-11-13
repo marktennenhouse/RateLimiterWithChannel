@@ -1,4 +1,4 @@
-using PaymentChannelDemo.Services;
+using PaymentRateLimiter.Core.Services;
 using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -12,8 +12,8 @@ builder.Services.AddControllers()
             new System.Text.Json.Serialization.JsonStringEnumConverter());
     });
 
-// Configure Azure Service Bus options
-builder.Services.Configure<AzureServiceBusOptions>(
+// Configure Azure Service Bus options (AzureServiceBusOptions is defined in PaymentServiceBusService.cs)
+builder.Services.Configure<PaymentRateLimiter.Core.Services.AzureServiceBusOptions>(
     builder.Configuration.GetSection("AzureServiceBus"));
 
 // Register our custom services

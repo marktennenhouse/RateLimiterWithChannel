@@ -62,7 +62,7 @@ See [PaymentRateLimiter.Core/README.md](PaymentRateLimiter.Core/README.md) for l
 
 ### Running the Example Web API
 
-The `PaymentChannelDemo` project is an example web API showing how to use the library:
+The `PaymentChannelDemo` project is an example web API that **uses the library** (via project reference). It demonstrates:
 
 ```bash
 # Restore dependencies
@@ -171,7 +171,7 @@ To adjust logging levels:
 {
   "Logging": {
     "LogLevel": {
-      "PaymentChannelDemo.Services.PaymentProcessorWorker": "Debug"
+      "PaymentRateLimiter.Core.Services.PaymentProcessorWorker": "Debug"
     }
   }
 }

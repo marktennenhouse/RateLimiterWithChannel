@@ -93,21 +93,24 @@ This project implements a complete credit card payment processing system with th
 - ✅ `appsettings.Development.json` - Development configuration
 - ✅ `Properties/launchSettings.json` - Launch profiles
 
-### Models
-- ✅ `Models/PaymentRequest.cs` - Full payment object with metadata
-- ✅ `Models/PaymentRequestDto.cs` - API input DTO
-- ✅ `Models/PaymentStatus.cs` - Status message object
-- ✅ `Models/PaymentStatusEnum.cs` - Status enumeration
+### Models (in PaymentRateLimiter.Core library)
+- ✅ `PaymentRateLimiter.Core/Models/PaymentRequest.cs` - Full payment object with metadata
+- ✅ `PaymentRateLimiter.Core/Models/PaymentRequestDto.cs` - API input DTO
+- ✅ `PaymentRateLimiter.Core/Models/PaymentStatus.cs` - Status message object
+- ✅ `PaymentRateLimiter.Core/Models/PaymentStatusEnum.cs` - Status enumeration
 
-### Services
-- ✅ `Services/PaymentServiceBusService.cs` - Azure Service Bus wrapper service
-- ✅ `Services/PaymentStatusService.cs` - Thread-safe status channel manager (for SSE)
-- ✅ `Services/PaymentProcessorWorker.cs` - Background worker using ServiceBusProcessor
+### Services (in PaymentRateLimiter.Core library)
+- ✅ `PaymentRateLimiter.Core/Services/PaymentServiceBusService.cs` - Azure Service Bus wrapper service
+- ✅ `PaymentRateLimiter.Core/Services/PaymentStatusService.cs` - Thread-safe status channel manager (for SSE)
+- ✅ `PaymentRateLimiter.Core/Services/PaymentProcessorWorker.cs` - Background worker using ServiceBusProcessor
 - ❌ `Services/PaymentCleanupService.cs` - **REMOVED** (Service Bus handles queue cleanup automatically)
+- ❌ `Services/PaymentChannelService.cs` - **REMOVED** (replaced by Service Bus)
+- ❌ `Models/*.cs` - **REMOVED** (now using library models)
+- ❌ `Services/*.cs` - **REMOVED** (now using library services)
 
-### Controllers
-- ✅ `Controllers/PaymentController.cs` - SSE endpoint with disconnection handling
-- ✅ `Controllers/WeatherForecastController.cs` - Example controller (can remove)
+### Controllers (in PaymentChannelDemo example project)
+- ✅ `Controllers/PaymentController.cs` - SSE endpoint with disconnection handling (uses library)
+- ❌ `Controllers/WeatherForecastController.cs` - **REMOVED** (example/template file)
 
 ### Documentation
 - ✅ `ARCHITECTURE.md` - Complete architectural documentation with lifecycle diagrams

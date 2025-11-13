@@ -139,7 +139,7 @@ namespace PaymentRateLimiter.Core.Services
             {
                 _logger.LogInformation("Status reader retrieved for payment {PaymentId}. Channel exists: {Exists}", 
                     paymentId, channel != null);
-                return channel.Reader;
+                return channel!.Reader;
             }
             
             _logger.LogWarning("No status channel found for payment {PaymentId} when getting reader", paymentId);

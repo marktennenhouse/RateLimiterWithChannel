@@ -1,7 +1,7 @@
 ﻿using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
-using PaymentChannelDemo.Models;
-using PaymentChannelDemo.Services;
+using PaymentRateLimiter.Core.Models;
+using PaymentRateLimiter.Core.Services;
 using System.Text.Json;
 
 namespace PaymentChannelDemo.Controllers

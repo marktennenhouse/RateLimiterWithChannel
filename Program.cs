@@ -1,4 +1,5 @@
 using PaymentChannelDemo.Services;
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -11,14 +12,17 @@ builder.Services.AddControllers()
             new System.Text.Json.Serialization.JsonStringEnumConverter());
     });
 
+// Configure Azure Service Bus options
+builder.Services.Configure<AzureServiceBusOptions>(
+    builder.Configuration.GetSection("AzureServiceBus"));
+
 // Register our custom services
 // Singleton ensures the same instance is shared across all requests
-builder.Services.AddSingleton<PaymentChannelService>();
+builder.Services.AddSingleton<PaymentServiceBusService>();
 builder.Services.AddSingleton<PaymentStatusService>();
 
 // Register background services (hosted services)
 builder.Services.AddHostedService<PaymentProcessorWorker>();
-builder.Services.AddHostedService<PaymentCleanupService>();
 
 // Add API documentation
 builder.Services.AddEndpointsApiExplorer();

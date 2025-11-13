@@ -15,18 +15,18 @@ namespace PaymentChannelDemo.Controllers
     [ApiController]
     public class PaymentController : ControllerBase
     {
-        private readonly PaymentChannelService _channelService;
+        private readonly PaymentServiceBusService _serviceBusService;
         private readonly PaymentStatusService _statusService;
         private readonly ILogger<PaymentController> _logger;
         private readonly JsonSerializerOptions _jsonOptions;
 
         public PaymentController(
-            PaymentChannelService channelService,
+            PaymentServiceBusService serviceBusService,
             PaymentStatusService statusService,
             ILogger<PaymentController> logger,
             IOptions<JsonOptions> jsonOptions)
         {
-            _channelService = channelService;
+            _serviceBusService = serviceBusService;
             _statusService = statusService;
             _logger = logger;
             _jsonOptions = jsonOptions.Value.JsonSerializerOptions;
@@ -84,8 +84,8 @@ namespace PaymentChannelDemo.Controllers
                 await Response.WriteAsync($"data: {initialMessage}\n\n", cts.Token);
                 await Response.Body.FlushAsync(cts.Token);
 
-                // Write payment to the queue for background processing
-                await _channelService.Writer.WriteAsync(paymentRequest, cts.Token);
+                // Send payment request to Azure Service Bus queue
+                await _serviceBusService.SendPaymentRequestAsync(paymentRequest, cts.Token);
 
                 // Get reader for this payment's status updates
                 var statusReader = _statusService.GetStatusReader(paymentRequest.PaymentId);

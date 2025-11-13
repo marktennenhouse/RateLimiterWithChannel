@@ -180,9 +180,9 @@ namespace PaymentChannelDemo.Services
         }
 
         /// <summary>
-        /// Periodic cleanup of stale payment records.
-        /// Called by PaymentCleanupService background worker.
-        /// Returns the number of records cleaned up.
+        /// Periodic cleanup of stale payment status channels.
+        /// Note: With Service Bus, queue cleanup is handled automatically.
+        /// This only cleans up status channels for disconnected or completed payments.
         /// </summary>
         public Task<int> CleanupStalePayments(TimeSpan disconnectedThreshold, TimeSpan anyPaymentThreshold)
         {
@@ -202,7 +202,7 @@ namespace PaymentChannelDemo.Services
             foreach (var paymentId in stalePayments)
             {
                 Cleanup(paymentId);
-                _logger.LogInformation("Cleaned up stale payment {PaymentId}", paymentId);
+                _logger.LogInformation("Cleaned up stale payment status channel {PaymentId}", paymentId);
             }
 
             return Task.FromResult(stalePayments.Count);

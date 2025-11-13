@@ -1,7 +1,10 @@
 namespace PaymentChannelDemo.Services
 {
     /// <summary>
-    /// Background service that periodically cleans up stale payment records.
+    /// Background service that removes payments from the main queue/channel  which have been processed or abandoned.
+    /// It cleans up stale payment records by looping thru the full channel,
+    /// filters out the older already processed records
+    /// and removes any that accidentally were left in there when the standard remove somehow failed.
     /// Acts as a safety net to prevent memory leaks from orphaned status channels.
     /// Runs every 5 minutes and removes:
     /// - Disconnected payments older than 10 minutes

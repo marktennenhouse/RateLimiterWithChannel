@@ -2,15 +2,15 @@
 
 ## Overview
 
-A credit card payment processing API that uses Channels for queuing requests and a background worker with rate limiting (max 5 concurrent) that communicates status updates back to clients via Server-Sent Events (SSE).
+A credit card payment processing API that uses **Azure Service Bus** for persistent, scalable queuing and a background worker with rate limiting (max 5 concurrent via ServiceBusProcessor MaxConcurrentCalls) that communicates status updates back to clients via Server-Sent Events (SSE).
 
 ## System Architecture
 
 ### Core Problem
 Three different threads need to communicate:
 1. **Client HTTP Thread** (Controller): Receives API requests, streams SSE responses
-2. **Main Payment Queue** (Channel): Shared queue where payment requests are stored
-3. **Background Worker Thread(s)**: Process payments with rate limiting and send status updates
+2. **Azure Service Bus Queue**: Persistent queue where payment requests are stored (survives restarts, scales across servers)
+3. **Background Worker Thread(s)**: Process payments with rate limiting (via ServiceBusProcessor MaxConcurrentCalls) and send status updates
 
 The challenge: Client thread must receive real-time status updates from the background worker thread.
 
@@ -24,7 +24,8 @@ Uses `PaymentStatusService` as a thread-safe bridge with per-payment channels:
 │  (Controller)       │
 │                     │
 │  1. Register payment│──┐
-│  2. Write to queue  │  │
+│  2. Send to        │  │
+│     Service Bus     │  │
 │  3. Read status     │  │
 │  4. Stream via SSE  │◄─┼─────┐
 └─────────────────────┘  │     │
@@ -41,18 +42,35 @@ Uses `PaymentStatusService` as a thread-safe bridge with per-payment channels:
         │                                │
         │  Each payment gets its own     │
         │  status communication channel  │
+        │  (Still needed for SSE)        │
+        └────────────────────────────────┘
+                         ▲
+                         │
+        ┌────────────────────────────────┐
+        │  Azure Service Bus Queue       │
+        │  (Persistent, Scalable)        │
+        │                                │
+        │  - Messages persist across     │
+        │    restarts                    │
+        │  - Scales across servers       │
+        │  - Automatic message           │
+        │    completion/cleanup          │
         └────────────────────────────────┘
                          ▲
                          │
 ┌─────────────────────┐  │
-│ Background Worker   │  │
-│ Thread Pool         │  │
+│ ServiceBusProcessor │  │
+│ (Background Worker) │  │
 │                     │  │
-│ 1. Read from queue  │  │
-│ 2. Rate limit (5)   │  │
+│ 1. Receive messages │  │
+│    from Service Bus │  │
+│ 2. MaxConcurrentCalls│ │
+│    = 5 (built-in)   │  │
 │ 3. Process payment  │  │
 │ 4. Send status      │──┘
 │    updates          │
+│ 5. Complete/Abandon │
+│    message          │
 └─────────────────────┘
 ```
 
@@ -85,11 +103,13 @@ Status message object sent from worker to client:
 
 ### 2. Services
 
-#### PaymentChannelService
-- Manages main payment queue using `Channel<PaymentRequest>`
-- Uses **bounded** channel (capacity: 1000) for backpressure protection
-- Exposes `Writer` and `Reader` properties
-- Thread-safe by design (Channel handles synchronization)
+#### PaymentServiceBusService
+- Wraps Azure Service Bus operations for payment processing
+- Creates `ServiceBusClient`, `ServiceBusSender`, and `ServiceBusProcessor`
+- `SendPaymentRequestAsync()`: Sends payment requests to Service Bus queue
+- `Processor`: ServiceBusProcessor with MaxConcurrentCalls configured
+- Handles message serialization/deserialization
+- **Benefits**: Persistent queue, scales across servers, automatic cleanup
 
 #### PaymentStatusService
 **Critical component** - bridges worker threads to client threads:
@@ -104,23 +124,19 @@ Status message object sent from worker to client:
 - `GetStatistics()`: Monitoring endpoint data
 
 #### PaymentProcessorWorker (BackgroundService)
-Rate-limited background processor:
-- Reads from `PaymentChannelService.Reader`
-- Uses `SemaphoreSlim(5, 5)` to limit to 5 concurrent payments
-- Spawns tasks for each payment (fire-and-forget with rate limiting)
+Rate-limited background processor using Azure Service Bus:
+- Uses `ServiceBusProcessor` to receive messages from Service Bus queue
+- **MaxConcurrentCalls = 5**: Built-in rate limiting (no manual semaphore needed)
+- Processes messages via `ProcessMessageAsync` event handler
 - Checks `IsPaymentCancelled()` at multiple checkpoints:
   - Before starting processing
   - After queuing delay
   - **Before calling third-party processor** (critical!)
 - Sends status updates via `PaymentStatusService`
-- Releases semaphore in finally block (always frees slot)
+- Completes or abandons messages based on processing result
+- **Benefits**: Automatic message locking, retry handling, dead letter queue support
 
-#### PaymentCleanupService (BackgroundService)
-Periodic cleanup of stale records:
-- Runs every 5 minutes
-- Removes payments older than 10 minutes (disconnected) or 20 minutes (any)
-- Prevents memory leaks from orphaned status channels
-- Logs cleanup statistics
+**Note**: PaymentCleanupService was removed - Service Bus handles message lifecycle automatically (completion, expiration, dead letter queue)
 
 ### 3. Controller
 
@@ -129,11 +145,11 @@ Handles SSE streaming to clients:
 - `POST /api/payment/process`: Single endpoint for payment processing
 - Sets `Content-Type: text/event-stream` header
 - Creates `PaymentRequest` object with metadata
-- Registers payment and writes to queue
+- Registers payment and sends to Azure Service Bus queue
 - **Monitors `HttpContext.RequestAborted`** for disconnection
 - Streams status updates in SSE format: `data: {json}\n\n`
 - Handles cancellation gracefully
-- Ensures cleanup in finally block
+- Ensures cleanup in finally block (status channels only - Service Bus handles queue cleanup)
 
 ## Client Disconnection Handling
 
@@ -165,16 +181,20 @@ When disconnection detected:
 - Semaphore slot immediately available for next payment
 - Cleanup scheduled
 
-## Cleanup Strategy - Multi-Level Approach
+## Cleanup Strategy - Simplified with Service Bus
 
-### Why Multiple Cleanup Events?
+### Service Bus Handles Queue Cleanup Automatically
 
-**Problem**: We have competing concerns:
-1. Client must receive ALL status messages (including final "Completed")
-2. Memory must be freed promptly to prevent leaks
-3. Must handle edge cases (crashes, missed cleanups)
+**Key Change**: With Azure Service Bus, queue message cleanup is handled automatically:
+- ✅ Messages are completed after successful processing
+- ✅ Messages are abandoned/redelivered on failure
+- ✅ Dead letter queue for permanently failed messages
+- ✅ Message TTL for automatic expiration
+- ✅ No manual queue cleanup needed
 
-**Solution**: Defense-in-depth with three cleanup levels
+### Status Channel Cleanup (Still Required)
+
+**Why**: Service Bus handles the queue, but we still need to clean up in-memory status channels used for SSE communication.
 
 ### Level 1: Immediate Cleanup (On Completion)
 **When**: Payment reaches terminal state (Completed/Failed)
@@ -194,30 +214,27 @@ When disconnection detected:
 - Mark payment as disconnected
 - Close status channel immediately
 - Update metadata with disconnection timestamp
+- **Service Bus message is abandoned** (will redeliver or go to dead letter queue)
 
 **Reasoning**:
 - No point keeping channel open if no reader exists
 - Frees memory immediately
 - Worker checks before expensive operations
-- Full cleanup happens after processing attempt
+- Service Bus handles message retry/cleanup automatically
 
-### Level 3: Periodic Cleanup (Every 5 Minutes)
-**When**: Background service runs on schedule
+### Level 3: Periodic Cleanup (Optional - Status Channels Only)
+**When**: Can be run periodically if needed
 **Action**:
-- Scan all payment metadata
+- Scan all payment metadata (status channels only)
 - Remove records older than threshold:
   - Disconnected > 10 minutes
   - Any payment > 20 minutes (safety net)
-- Log cleanup statistics
+- **Note**: Service Bus queue cleanup is automatic, this only cleans status channels
 
 **Reasoning**:
-- Catches orphaned records from edge cases:
-  - Worker crashes before cleanup
-  - Exceptions preventing normal cleanup
-  - Race conditions
-  - Unexpected code paths
-- Acts as safety net for memory leaks
-- Configurable thresholds for different load patterns
+- Catches orphaned status channels from edge cases
+- Acts as safety net for memory leaks in status channel dictionary
+- Service Bus handles queue messages automatically
 
 ### Cleanup Lifecycle Example
 
@@ -264,17 +281,17 @@ T+0s    Client          POST /api/payment/process
 T+0s    Client          Register payment            _statusChannels[id] = new Channel
                                                     _paymentMetadata[id] = new Metadata
 
-T+0s    Client          Write to queue              _paymentChannel.Writer.WriteAsync(request)
+T+0s    Client          Send to Service Bus         _serviceBusService.SendPaymentRequestAsync(request)
 
 T+0s    Client          Wait for status             await foreach (statusReader.ReadAllAsync())
                         [BLOCKED - waiting]         
 
-T+0s    Worker          Read from queue             _paymentChannel.Reader.ReadAllAsync()
-                        - Dequeue PaymentRequest    
+T+0s    Worker          Receive from Service Bus    ServiceBusProcessor.ProcessMessageAsync()
+                        - Deserialize PaymentRequest    
 
 T+0s    Worker          Check cancellation          IsPaymentCancelled() = false ✓
 
-T+0s    Worker          Acquire semaphore           _semaphore.WaitAsync() [4 slots left]
+T+0s    Worker          MaxConcurrentCalls check     ServiceBusProcessor [4 slots available]
 
 T+1s    Worker          Send status: Queued         _statusChannels[id].Writer.WriteAsync()
 
@@ -304,7 +321,7 @@ T+8s    Client          Receive status              yield return "Completed"
 T+8s    Client          Close connection            Response completes
                         Finally block               Cleanup(paymentId)
 
-T+8s    Worker          Release semaphore           _semaphore.Release() [5 slots available]
+T+8s    Worker          Complete message            args.CompleteMessageAsync() [Message removed]
 
 T+13s   Delayed         Remove from memory          _statusChannels.Remove(id)
         Cleanup                                     _paymentMetadata.Remove(id)
@@ -336,7 +353,7 @@ T+5s    Client          Connection closed           Response ends, finally execu
 T+6s    Worker          Check cancellation          IsPaymentCancelled() = true ✗
                         SKIP processing             No third-party call made ✓
 
-T+6s    Worker          Release semaphore           _semaphore.Release()
+T+6s    Worker          Abandon message             args.AbandonMessageAsync()
                         Early exit                  return; (no completion status sent)
 
 T+6s    Worker          Cleanup                     _statusChannels.Remove(id)
@@ -379,23 +396,28 @@ T+20min Cleanup         Periodic scan runs
 
 ## Rate Limiting
 
-### Semaphore Pattern
+### ServiceBusProcessor MaxConcurrentCalls
 ```csharp
-private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(5, 5);
-
-await _semaphore.WaitAsync();  // Blocks if 5 payments already processing
-try {
-    // Process payment (only 5 concurrent)
-} finally {
-    _semaphore.Release();  // Always release, even on disconnect/error
-}
+// In PaymentServiceBusService.cs
+var processorOptions = new ServiceBusProcessorOptions
+{
+    MaxConcurrentCalls = 5,  // Limits concurrent message processing
+    AutoCompleteMessages = false
+};
 ```
+
+### How It Works
+- **ServiceBusProcessor automatically limits** concurrent message handlers to 5
+- No manual semaphore needed - built into the processor
+- When MaxConcurrentCalls=5, only 5 messages are processed concurrently
+- Additional messages wait in the Service Bus queue until a slot is available
+- Message locking prevents duplicate processing across multiple servers
 
 ### Why 5 Concurrent?
 - Third-party processor limits
 - Resource constraints (memory, connections)
 - Quality of service (prevent overload)
-- Configurable for different environments
+- Configurable via `AzureServiceBusOptions.MaxConcurrentCalls`
 
 ## Monitoring & Debugging
 
@@ -460,20 +482,36 @@ processPayment(id: string): Observable<PaymentStatus> {
 ## Configuration
 
 ### Configurable Parameters
-- Semaphore limit (concurrent payments): Default 5
-- Channel capacity (queue size): Default 1000
-- Cleanup interval: Default 5 minutes
-- Stale threshold: Default 10 minutes (disconnected), 20 minutes (any)
-- Delayed cleanup: Default 5 seconds
+- **MaxConcurrentCalls**: Default 5 (via `AzureServiceBusOptions`)
+- **Service Bus Connection String**: Required in `appsettings.json`
+- **Queue Name**: Default "payment-requests"
+- **AutoCompleteMessages**: Default false (manual completion for better control)
+- **MaxAutoLockRenewalDuration**: Default 5 minutes
+- **Status channel cleanup**: Delayed cleanup (5 seconds) for completed payments
+
+### Azure Service Bus Configuration
+```json
+{
+  "AzureServiceBus": {
+    "ConnectionString": "Endpoint=sb://...",
+    "QueueName": "payment-requests",
+    "MaxConcurrentCalls": 5,
+    "AutoCompleteMessages": false,
+    "MaxAutoLockRenewalDuration": "00:05:00"
+  }
+}
+```
 
 ## Service Registration
 
 ```csharp
 // Program.cs
-builder.Services.AddSingleton<PaymentChannelService>();
+builder.Services.Configure<AzureServiceBusOptions>(
+    builder.Configuration.GetSection("AzureServiceBus"));
+builder.Services.AddSingleton<PaymentServiceBusService>();
 builder.Services.AddSingleton<PaymentStatusService>();
 builder.Services.AddHostedService<PaymentProcessorWorker>();
-builder.Services.AddHostedService<PaymentCleanupService>();
+// PaymentCleanupService removed - Service Bus handles queue cleanup automatically
 ```
 
 ## Security Considerations
@@ -487,11 +525,12 @@ builder.Services.AddHostedService<PaymentCleanupService>();
 
 ## Future Enhancements
 
-- Persistent queue (survive restarts)
-- Payment retry logic
-- Dead letter queue for failed payments
-- Distributed rate limiting (multiple servers)
-- Redis-backed status channels (scale-out)
+- ✅ **Persistent queue**: Implemented via Azure Service Bus (survives restarts)
+- ✅ **Distributed rate limiting**: Implemented via Service Bus (works across multiple servers)
+- ✅ **Dead letter queue**: Available via Service Bus configuration
+- Payment retry logic (can use Service Bus retry policies)
+- Redis-backed status channels (for multi-server SSE scaling)
 - Webhook callbacks as alternative to SSE
 - Payment status query endpoint (polling alternative)
+- Service Bus sessions for FIFO ordering (if needed)
 

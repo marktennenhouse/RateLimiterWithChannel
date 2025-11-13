@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Payment Rate Limiter - Library Client Example</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            border-radius: 8px;
+            padding: 30px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            border-bottom: 3px solid #007bff;
+            padding-bottom: 10px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 600;
+            color: #555;
+        }
+        input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            margin-right: 10px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        .status-container {
+            margin-top: 30px;
+            padding: 20px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+            min-height: 200px;
+        }
+        .status-item {
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 4px;
+            border-left: 4px solid #007bff;
+            background: white;
+        }
+        .status-queued {
+            border-left-color: #ffc107;
+        }
+        .status-processing {
+            border-left-color: #17a2b8;
+        }
+        .status-sendingtoprocessor {
+            border-left-color: #6f42c1;
+        }
+        .status-completed {
+            border-left-color: #28a745;
+        }
+        .status-failed {
+            border-left-color: #dc3545;
+        }
+        .payment-id {
+            font-weight: 600;
+            color: #007bff;
+        }
+        .info-box {
+            background-color: #e7f3ff;
+            border-left: 4px solid #007bff;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 4px;
+        }
+        .code-example {
+            background-color: #f4f4f4;
+            padding: 15px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            overflow-x: auto;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Payment Rate Limiter - Library Usage Example</h1>
+        
+        <div class="info-box">
+            <strong>Note:</strong> This page demonstrates how a client application would use the PaymentRateLimiter.Core library.
+            In a real application, you would integrate the library into your backend service and expose endpoints for clients.
+            This example shows the client-side interface that would interact with your service.
+        </div>
+
+        <h2>Process Payment</h2>
+        <form id="paymentForm">
+            <div class="form-group">
+                <label for="amount">Amount ($)</label>
+                <input type="number" id="amount" step="0.01" value="99.99" required>
+            </div>
+            <div class="form-group">
+                <label for="cardToken">Card Token</label>
+                <input type="text" id="cardToken" value="tok_demo_123456" required>
+            </div>
+            <div class="form-group">
+                <label for="email">Customer Email</label>
+                <input type="email" id="email" value="customer@example.com">
+            </div>
+            <button type="submit" id="submitBtn">Process Payment</button>
+            <button type="button" id="clearBtn">Clear Status</button>
+        </form>
+
+        <div class="status-container">
+            <h3>Status Updates</h3>
+            <div id="status-container">
+                <p style="color: #888;">No payment processed yet. Submit a payment to see status updates.</p>
+            </div>
+        </div>
+
+        <div class="code-example">
+            <strong>How to use PaymentRateLimiter.Core in your application:</strong><br><br>
+            <pre>
+// 1. Register services in Program.cs or Startup.cs
+services.Configure&lt;AzureServiceBusOptions&gt;(options => {
+    options.ConnectionString = "Endpoint=sb://...";
+    options.QueueName = "payment-requests";
+    options.MaxConcurrentCalls = 5;
+});
+services.AddSingleton&lt;PaymentServiceBusService&gt;();
+services.AddSingleton&lt;PaymentStatusService&gt;();
+services.AddHostedService&lt;PaymentProcessorWorker&gt;();
+
+// 2. In your service/controller
+var paymentRequest = new PaymentRequest {
+    PaymentId = Guid.NewGuid().ToString(),
+    Amount = 99.99m,
+    CardToken = "tok_123",
+    QueuedAt = DateTime.UtcNow
+};
+
+_statusService.RegisterPayment(paymentRequest);
+await _serviceBusService.SendPaymentRequestAsync(paymentRequest);
+
+// 3. Subscribe to status updates
+var statusReader = _statusService.GetStatusReader(paymentRequest.PaymentId);
+await foreach (var status in statusReader.ReadAllAsync()) {
+    // Handle status update
+    Console.WriteLine($"{status.Status}: {status.Message}");
+}
+            </pre>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = 'https://localhost:7000/api/payment'; // Your API endpoint that uses the library
+        
+        const form = document.getElementById('paymentForm');
+        const submitBtn = document.getElementById('submitBtn');
+        const clearBtn = document.getElementById('clearBtn');
+        const statusContainer = document.getElementById('status-container');
+
+        let currentPaymentId = null;
+        let eventSource = null;
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const amount = parseFloat(document.getElementById('amount').value);
+            const cardToken = document.getElementById('cardToken').value;
+            const email = document.getElementById('email').value;
+
+            submitBtn.disabled = true;
+            statusContainer.innerHTML = '<p>Processing payment...</p>';
+
+            try {
+                // Send payment request to your API (which uses the library)
+                const response = await fetch(`${API_URL}/process`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        amount: amount,
+                        cardToken: cardToken,
+                        customerEmail: email
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                // Read SSE stream
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    
+                    if (done) {
+                        break;
+                    }
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            const data = line.substring(6);
+                            try {
+                                const status = JSON.parse(data);
+                                displayStatus(status);
+                                
+                                // Store payment ID from initial message
+                                if (status.paymentId && !currentPaymentId) {
+                                    currentPaymentId = status.paymentId;
+                                }
+                            } catch (err) {
+                                console.error('Error parsing status:', err);
+                            }
+                        }
+                    }
+                }
+
+                submitBtn.disabled = false;
+            } catch (error) {
+                console.error('Error processing payment:', error);
+                statusContainer.innerHTML = `<p style="color: red;">Error: ${error.message}</p>`;
+                submitBtn.disabled = false;
+            }
+        });
+
+        clearBtn.addEventListener('click', () => {
+            statusContainer.innerHTML = '<p style="color: #888;">Status cleared.</p>';
+            currentPaymentId = null;
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+        });
+
+        function displayStatus(status) {
+            if (status.paymentId && !status.status) {
+                statusContainer.innerHTML = `
+                    <h3>Payment ID: <span class="payment-id">${status.paymentId}</span></h3>
+                    <p>${status.message || 'Payment request received'}</p>
+                `;
+                return;
+            }
+            
+            if (status.status === undefined || status.status === null || !status.message) {
+                console.warn('Invalid status object:', status);
+                return;
+            }
+            
+            const statusEnumMap = {
+                0: 'Queued',
+                1: 'Processing',
+                2: 'SendingToProcessor',
+                3: 'Completed',
+                4: 'Failed'
+            };
+            
+            let statusString = status.status;
+            if (typeof status.status === 'number') {
+                statusString = statusEnumMap[status.status] || `Status${status.status}`;
+            }
+            
+            let timestamp = '';
+            try {
+                if (status.timestamp) {
+                    const date = new Date(status.timestamp);
+                    if (!isNaN(date.getTime())) {
+                        timestamp = date.toLocaleTimeString();
+                    }
+                }
+            } catch (e) {
+                console.warn('Invalid timestamp:', status.timestamp);
+            }
+            
+            const statusClass = statusString.toLowerCase();
+            
+            const statusItem = document.createElement('div');
+            statusItem.className = `status-item status-${statusClass}`;
+            statusItem.innerHTML = `
+                <strong>${statusString}:</strong> ${status.message}
+                ${timestamp ? `<span style="float:right; color:#888;">${timestamp}</span>` : ''}
+            `;
+            
+            statusContainer.appendChild(statusItem);
+            
+            if (statusString === 'Completed' || statusString === 'Failed' || 
+                status.status === 3 || status.status === 4) {
+                submitBtn.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>
+

@@ -7,8 +7,8 @@ namespace PaymentRateLimiter.Core.Services
 {
     /// <summary>
     /// Thread-safe service that manages per-payment status channels.
-    /// Acts as a bridge between background worker threads and client HTTP threads.
-    /// Workers send status updates, clients stream them via SSE.
+    /// Acts as a bridge between background worker threads and client threads.
+    /// Workers send status updates, clients can subscribe to them.
     /// </summary>
     public class PaymentStatusService
     {
@@ -34,7 +34,7 @@ namespace PaymentRateLimiter.Core.Services
 
         /// <summary>
         /// Register a new payment and create its status channel.
-        /// Called by the client thread when initiating payment.
+        /// Called when initiating payment.
         /// </summary>
         public void RegisterPayment(PaymentRequest request)
         {
@@ -52,7 +52,6 @@ namespace PaymentRateLimiter.Core.Services
 
         /// <summary>
         /// Mark a payment as disconnected (client closed connection).
-        /// Called by the controller when HttpContext.RequestAborted fires.
         /// </summary>
         public void MarkDisconnected(string paymentId)
         {
@@ -132,12 +131,11 @@ namespace PaymentRateLimiter.Core.Services
         }
 
         /// <summary>
-        /// Get a reader for streaming status updates to the client.
-        /// Called by the controller thread.
+        /// Get a reader for streaming status updates.
         /// </summary>
         public ChannelReader<PaymentStatus>? GetStatusReader(string paymentId)
         {
-            if (_statusChannels.TryGetValue(paymentId, out var channel))
+            if (_statusChannels.TryGetValue(paymentId, out var channel) && channel != null)
             {
                 _logger.LogInformation("Status reader retrieved for payment {PaymentId}. Channel exists: {Exists}", 
                     paymentId, channel != null);
@@ -181,9 +179,9 @@ namespace PaymentRateLimiter.Core.Services
         }
 
         /// <summary>
-        /// Periodic cleanup of stale payment records.
-        /// Called by PaymentCleanupService background worker.
-        /// Returns the number of records cleaned up.
+        /// Periodic cleanup of stale payment status channels.
+        /// Note: With Service Bus, queue cleanup is handled automatically.
+        /// This only cleans up status channels for disconnected or completed payments.
         /// </summary>
         public Task<int> CleanupStalePayments(TimeSpan disconnectedThreshold, TimeSpan anyPaymentThreshold)
         {
@@ -203,7 +201,7 @@ namespace PaymentRateLimiter.Core.Services
             foreach (var paymentId in stalePayments)
             {
                 Cleanup(paymentId);
-                _logger.LogInformation("Cleaned up stale payment {PaymentId}", paymentId);
+                _logger.LogInformation("Cleaned up stale payment status channel {PaymentId}", paymentId);
             }
 
             return Task.FromResult(stalePayments.Count);
@@ -223,4 +221,3 @@ namespace PaymentRateLimiter.Core.Services
         }
     }
 }
-

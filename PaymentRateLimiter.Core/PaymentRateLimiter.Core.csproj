@@ -6,13 +6,15 @@
     <Nullable>enable</Nullable>
     <RootNamespace>PaymentRateLimiter.Core</RootNamespace>
     <AssemblyName>PaymentRateLimiter.Core</AssemblyName>
-    <Description>Payment processing rate limiter with Server-Sent Events support</Description>
-    <Version>1.0.0</Version>
+    <Description>Payment processing rate limiter with Azure Service Bus and real-time status updates</Description>
+    <Version>2.0.0</Version>
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Azure.Messaging.ServiceBus" Version="7.20.1" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.10" />
-    <PackageReference Include="Microsoft.AspNetCore.Mvc.Core" Version="2.2.5" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.10" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="9.0.10" />
   </ItemGroup>
 
 </Project>

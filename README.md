@@ -1,156 +1,154 @@
-# Payment Rate Limiter API
+# Payment Rate Limiter
 
-A C# ASP.NET Core Web API for processing credit card payments with rate limiting and real-time status updates.
+A C# class library for processing credit card payments with Azure Service Bus rate limiting and real-time status updates. Can be integrated into any .NET application.
 
 ## Features
 
-- **Rate-Limited Processing**: Maximum 5 concurrent payment operations using semaphore-based concurrency control
+- **Rate-Limited Processing**: Maximum 5 concurrent payment operations using Azure Service Bus MaxConcurrentCalls
+- **Persistent Queue**: Azure Service Bus queue survives server restarts and scales across multiple servers
 - **Real-Time Updates**: Server-Sent Events (SSE) stream status updates to clients
 - **Disconnection Handling**: Detects client disconnects and cancels payment processing before charging
-- **Memory Management**: Multi-level cleanup strategy prevents memory leaks
-- **Thread-Safe**: Uses channels for safe cross-thread communication
+- **Memory Management**: Simplified cleanup (Service Bus handles queue cleanup automatically)
+- **Thread-Safe**: Uses Service Bus and channels for safe cross-thread communication
 - **Production Ready**: Comprehensive logging, error handling, and monitoring
+
+## Project Structure
+
+This repository contains:
+
+1. **PaymentRateLimiter.Core** - The reusable class library (use this in your projects)
+2. **PaymentChannelDemo** - Example web API demonstrating library usage
+3. **ClientExamples** - Examples showing how to use the library
 
 ## Architecture
 
-The system uses a producer-consumer pattern with three main threads:
+The library uses a producer-consumer pattern with Azure Service Bus:
 
-1. **Client Thread (Controller)**: Receives HTTP requests, streams SSE responses
-2. **Payment Queue (Channel)**: Bounded queue with capacity of 1000 requests
-3. **Worker Threads**: Process payments with rate limiting (max 5 concurrent)
+1. **Your Application**: Sends payment requests via `PaymentServiceBusService`
+2. **Azure Service Bus Queue**: Persistent queue that survives restarts and scales across servers
+3. **ServiceBusProcessor**: Processes messages with built-in rate limiting (max 5 concurrent)
 
 ### Key Components
 
-- **PaymentChannelService**: Manages the main payment queue
-- **PaymentStatusService**: Thread-safe bridge for worker→client communication
-- **PaymentProcessorWorker**: Background service with rate limiting
-- **PaymentCleanupService**: Periodic cleanup of stale records
-- **PaymentController**: SSE endpoint for client connections
+- **PaymentServiceBusService**: Wraps Azure Service Bus operations (sending/receiving messages)
+- **PaymentStatusService**: Thread-safe bridge for worker→client communication (status channels)
+- **PaymentProcessorWorker**: Background service using ServiceBusProcessor with MaxConcurrentCalls
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed documentation.
+See [PaymentRateLimiter.Core/README.md](PaymentRateLimiter.Core/README.md) for library usage and [ARCHITECTURE.md](ARCHITECTURE.md) for detailed documentation.
 
 ## Getting Started
 
 ### Prerequisites
 
 - .NET 8.0 SDK or later
+- Azure Service Bus namespace and queue
 - Visual Studio 2022 / VS Code / Rider
 
-### Running the API
+### Using the Library
+
+1. **Add the library to your project**:
+   ```bash
+   dotnet add reference PaymentRateLimiter.Core/PaymentRateLimiter.Core.csproj
+   ```
+
+2. **Register services** (see [PaymentRateLimiter.Core/README.md](PaymentRateLimiter.Core/README.md) for details)
+
+3. **Use in your code**:
+   ```csharp
+   var paymentRequest = new PaymentRequest { ... };
+   _statusService.RegisterPayment(paymentRequest);
+   await _serviceBusService.SendPaymentRequestAsync(paymentRequest);
+   ```
+
+### Running the Example Web API
+
+The `PaymentChannelDemo` project is an example web API showing how to use the library:
 
 ```bash
 # Restore dependencies
 dotnet restore
 
 # Run the application
-dotnet run
+dotnet run --project PaymentChannelDemo
 
-# Or with hot reload
-dotnet watch run
+# The API will be available at:
+# HTTPS: https://localhost:7000
+# Swagger UI: https://localhost:7000/swagger
 ```
 
-The API will be available at:
-- HTTPS: `https://localhost:7000`
-- HTTP: `http://localhost:5000`
+## Library Usage
 
-Swagger UI: `https://localhost:7000/swagger`
+### Basic Example
 
-## API Endpoints
+```csharp
+// Register services
+services.Configure<AzureServiceBusOptions>(options => {
+    options.ConnectionString = "Endpoint=sb://...";
+    options.QueueName = "payment-requests";
+    options.MaxConcurrentCalls = 5;
+});
+services.AddSingleton<PaymentServiceBusService>();
+services.AddSingleton<PaymentStatusService>();
+services.AddHostedService<PaymentProcessorWorker>();
 
-### Process Payment (SSE Stream)
+// Use in your code
+var paymentRequest = new PaymentRequest {
+    PaymentId = Guid.NewGuid().ToString(),
+    Amount = 99.99m,
+    CardToken = "tok_demo_123456",
+    QueuedAt = DateTime.UtcNow
+};
 
-```http
-POST /api/payment/process
-Content-Type: application/json
+_statusService.RegisterPayment(paymentRequest);
+await _serviceBusService.SendPaymentRequestAsync(paymentRequest);
 
-{
-  "amount": 99.99,
-  "cardToken": "tok_demo_123456",
-  "customerEmail": "customer@example.com"
+// Subscribe to status updates
+var statusReader = _statusService.GetStatusReader(paymentRequest.PaymentId);
+await foreach (var status in statusReader.ReadAllAsync()) {
+    Console.WriteLine($"{status.Status}: {status.Message}");
 }
 ```
 
-**Response**: Server-Sent Event stream
-
-```
-data: {"paymentId":"abc123","message":"Payment request received"}
-
-data: {"paymentId":"abc123","status":"Queued","message":"Payment queued...","timestamp":"..."}
-
-data: {"paymentId":"abc123","status":"Processing","message":"Processing payment details","timestamp":"..."}
-
-data: {"paymentId":"abc123","status":"SendingToProcessor","message":"Sending payment...","timestamp":"..."}
-
-data: {"paymentId":"abc123","status":"Completed","message":"Payment of $99.99 completed successfully","timestamp":"..."}
-```
-
-### Get Statistics
-
-```http
-GET /api/payment/status/stats
-```
-
-**Response**:
-```json
-{
-  "activePayments": 12,
-  "disconnectedPayments": 3,
-  "totalInMemory": 15,
-  "timestamp": "2025-11-06T10:30:00Z"
-}
-```
+See [PaymentRateLimiter.Core/README.md](PaymentRateLimiter.Core/README.md) for complete usage examples.
 
 ## Client Examples
 
-### Vanilla JavaScript
+### C# Library Usage
 
-See [ClientExamples/vanilla-javascript-client.html](ClientExamples/vanilla-javascript-client.html)
+See [ClientExamples/LibraryUsageExample.cs](ClientExamples/LibraryUsageExample.cs) for a complete example showing how to:
+- Register services
+- Send payment requests
+- Subscribe to status updates
 
-```javascript
-fetch('https://localhost:7000/api/payment/process', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ amount: 99.99, cardToken: 'tok_demo_123456' })
-})
-.then(response => {
-  const reader = response.body.getReader();
-  // Read SSE stream...
-});
-```
+### HTML Client Example
 
-### Angular
+See [ClientExamples/library-client-example.html](ClientExamples/library-client-example.html) for an HTML page demonstrating client-side interaction with an API that uses the library.
 
-See [ClientExamples/angular-payment.service.ts](ClientExamples/angular-payment.service.ts)
+### Web API Example
 
-```typescript
-this.paymentService.processPayment({
-  amount: 99.99,
-  cardToken: 'tok_demo_123456'
-}).subscribe({
-  next: (status) => console.log(status),
-  complete: () => console.log('Done')
-});
-```
+The `PaymentChannelDemo` project shows how to create a web API using the library with Server-Sent Events (SSE) streaming.
 
 ## Configuration
 
+### Azure Service Bus Configuration
+
+Configure in your `appsettings.json` or via code:
+
+```json
+{
+  "AzureServiceBus": {
+    "ConnectionString": "Endpoint=sb://your-namespace.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=your-key",
+    "QueueName": "payment-requests",
+    "MaxConcurrentCalls": 5,
+    "AutoCompleteMessages": false,
+    "MaxAutoLockRenewalDuration": "00:05:00"
+  }
+}
+```
+
 ### Rate Limiting
 
-Edit `Services/PaymentProcessorWorker.cs`:
-
-```csharp
-// Change from 5 to desired concurrency
-private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(10, 10);
-```
-
-### Cleanup Intervals
-
-Edit `Services/PaymentCleanupService.cs`:
-
-```csharp
-private readonly TimeSpan _cleanupInterval = TimeSpan.FromMinutes(5);
-private readonly TimeSpan _disconnectedThreshold = TimeSpan.FromMinutes(10);
-```
+Change `MaxConcurrentCalls` to adjust concurrent processing (default: 5).
 
 ### CORS Origins
 
@@ -220,9 +218,12 @@ curl -X POST https://localhost:7000/api/payment/process \
 
 ### Scaling
 
-- Current implementation: Single server, in-memory state
-- For multi-server: Replace `PaymentStatusService` with Redis Pub/Sub
-- For persistence: Add database for payment records
+- ✅ **Queue scales**: Azure Service Bus queue works across multiple servers
+- ✅ **Rate limiting scales**: MaxConcurrentCalls works across servers automatically
+- ⚠️ **Status channels**: Still in-memory (for SSE). To scale SSE:
+  - Use Redis Pub/Sub for status updates, OR
+  - Use webhooks instead of SSE, OR
+  - Use polling endpoint instead of SSE
 - For observability: Add distributed tracing (OpenTelemetry)
 
 ### Monitoring

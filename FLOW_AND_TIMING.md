@@ -25,9 +25,9 @@ T+1ms   Controller      Send initial SSE message
                         "Payment request received"      HTTP Response (SSE)
                         Flush response                  Stream: data: {...}\n\n
                         ↓
-T+2ms   Controller      Write to main channel           
-                        _channelService.Writer          Channel<PaymentRequest>
-                        WriteAsync(paymentRequest)       Payment queued
+T+2ms   Controller      Send to Service Bus queue        
+                        _serviceBusService              Service Bus Queue
+                        SendPaymentRequestAsync()        Message queued (persistent)
                         ↓
 T+3ms   Controller      Get status reader              
                         _statusService.GetStatusReader() ChannelReader<PaymentStatus>
@@ -36,9 +36,9 @@ T+4ms   Controller      Start ReadAllAsync()
                         await foreach (status...)      [BLOCKED - waiting]
                         ↓
                         ─────────────────────────────────────────────────────
-T+5ms   Worker          Read from main channel         
-                        _channelService.Reader          Dequeue PaymentRequest
-                        ReadAllAsync() yields           
+T+5ms   Worker          Receive from Service Bus        
+                        ServiceBusProcessor             ProcessMessageAsync fires
+                        ProcessMessageAsync()            Deserialize PaymentRequest
                         ↓
 T+6ms   Worker          SendStatusAsync()              
                         "Payment dequeued, waiting..."  ChannelWriter.WriteAsync()
@@ -56,12 +56,9 @@ T+9ms   Controller      Write to HTTP response
                         Flush response                  Client receives update
                         ↓
                         ─────────────────────────────────────────────────────
-T+10ms  Worker          Wait for semaphore              
-                        _processingSemaphore.WaitAsync() [BLOCKED if 5 busy]
-                        (In this case: immediate)       Slot acquired
-                        ↓
-T+11ms  Worker          Create Task.Run()               
-                        Task.Run(ProcessPaymentAsync)   Background task spawned
+T+10ms  Worker          MaxConcurrentCalls check        
+                        ServiceBusProcessor             [Only 5 concurrent allowed]
+                        (In this case: immediate)      Message handler starts
                         ↓
 T+12ms  Worker Task     ProcessPaymentAsync starts      
                         Check if cancelled              
@@ -124,8 +121,8 @@ T+8024ms Controller      ReadAllAsync() completes
 T+8025ms Controller      Stream completed normally      
                         Connection closes               HTTP Response ends
                         ↓
-T+8026ms Worker Task     Release semaphore              
-                        _processingSemaphore.Release()  Slot freed (5 available)
+T+8026ms Worker Task     Complete message                
+                        args.CompleteMessageAsync()     Message removed from queue
                         ↓
 T+8027ms Delayed         Cleanup scheduled              
                         Task.Delay(5000)                Cleanup in 5 seconds

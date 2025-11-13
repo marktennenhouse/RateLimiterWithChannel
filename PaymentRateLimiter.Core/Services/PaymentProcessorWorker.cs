@@ -1,50 +1,103 @@
-﻿using Microsoft.Extensions.Hosting;
+﻿using Azure.Messaging.ServiceBus;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using PaymentRateLimiter.Core.Models;
+using System.Text.Json;
 
 namespace PaymentRateLimiter.Core.Services
 {
     /// <summary>
-    /// Background service that processes payments from the queue with rate limiting.
-    /// Limits to 5 concurrent payment operations using a semaphore.
+    /// Background service that processes payments from Azure Service Bus queue with rate limiting.
+    /// Uses ServiceBusProcessor with MaxConcurrentCalls to limit to 5 concurrent payment operations.
     /// Sends status updates back to clients via PaymentStatusService.
     /// </summary>
     public class PaymentProcessorWorker : BackgroundService
     {
-        private readonly PaymentChannelService _channelService;
+        private readonly PaymentServiceBusService _serviceBusService;
         private readonly PaymentStatusService _statusService;
         private readonly ILogger<PaymentProcessorWorker> _logger;
-        
-        // Rate limiter: max 5 concurrent payment processing operations
-        // Note: This semaphore is now used within ProcessPaymentAsync for the actual processing
-        // The ExecuteAsync method uses its own semaphore to limit task creation
-        private readonly SemaphoreSlim _processingSemaphore = new SemaphoreSlim(5, 5);
 
         public PaymentProcessorWorker(
-            PaymentChannelService channelService,
+            PaymentServiceBusService serviceBusService,
             PaymentStatusService statusService,
             ILogger<PaymentProcessorWorker> logger)
         {
-            _channelService = channelService;
+            _serviceBusService = serviceBusService;
             _statusService = statusService;
             _logger = logger;
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _logger.LogInformation("PaymentProcessorWorker started. Max concurrent: 5");
+            _logger.LogInformation("PaymentProcessorWorker started. Using Service Bus with MaxConcurrentCalls limit.");
 
-            // Process payments with controlled concurrency
-            // This pattern limits both the number of tasks created AND concurrent processing
-            // By waiting for semaphore BEFORE creating the task, we prevent creating unlimited tasks
-            // With 1000 users: only 5 tasks exist at once (not 1000 tasks waiting)
-            
-            await foreach (var paymentRequest in _channelService.Reader.ReadAllAsync(stoppingToken))
+            var processor = _serviceBusService.Processor;
+
+            // Configure message handler
+            processor.ProcessMessageAsync += async args =>
             {
-                var paymentId = paymentRequest.PaymentId;
-                
-                // Send status immediately when dequeued (before semaphore wait)
-                // This lets the client know the payment is in the queue
+                try
+                {
+                    await ProcessServiceBusMessageAsync(args, stoppingToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error processing Service Bus message {MessageId}", args.Message.MessageId);
+                    // Don't complete the message - let it go to dead letter queue or retry
+                    throw;
+                }
+            };
+
+            // Configure error handler
+            processor.ProcessErrorAsync += args =>
+            {
+                _logger.LogError(args.Exception, "Service Bus processor error: {ErrorSource}", args.ErrorSource);
+                return Task.CompletedTask;
+            };
+
+            // Start processing messages
+            await _serviceBusService.StartProcessingAsync(stoppingToken);
+
+            // Wait until cancellation is requested
+            try
+            {
+                await Task.Delay(Timeout.Infinite, stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("PaymentProcessorWorker stopping due to cancellation");
+            }
+            finally
+            {
+                await _serviceBusService.StopProcessingAsync(stoppingToken);
+            }
+        }
+
+        private async Task ProcessServiceBusMessageAsync(ProcessMessageEventArgs args, CancellationToken stoppingToken)
+        {
+            PaymentRequest? paymentRequest = null;
+            var paymentId = args.Message.MessageId ?? "";
+
+            try
+            {
+                // Deserialize payment request from message body
+                var messageBody = args.Message.Body.ToString();
+                paymentRequest = JsonSerializer.Deserialize<PaymentRequest>(messageBody);
+
+                if (paymentRequest == null)
+                {
+                    _logger.LogError("Failed to deserialize payment request from message {MessageId}", args.Message.MessageId);
+                    await args.CompleteMessageAsync(args.Message, stoppingToken);
+                    return;
+                }
+
+                paymentId = paymentRequest.PaymentId;
+
+                _logger.LogInformation(
+                    "Payment message received from Service Bus. PaymentId: {PaymentId}, Amount: {Amount}",
+                    paymentId, paymentRequest.Amount);
+
+                // Send status immediately when message is received (before processing)
                 await _statusService.SendStatusAsync(paymentId, new PaymentStatus
                 {
                     PaymentId = paymentId,
@@ -52,31 +105,49 @@ namespace PaymentRateLimiter.Core.Services
                     Message = "Payment dequeued, waiting for processing slot...",
                     Timestamp = DateTime.UtcNow
                 });
-                
-                // Wait for semaphore slot before creating task
-                // This prevents creating unlimited tasks - only creates task when slot is available
-                await _processingSemaphore.WaitAsync(stoppingToken);
-                
-                // Fire and forget - but we've already acquired the slot
-                _ = Task.Run(async () =>
+
+                // Process the payment
+                // Note: MaxConcurrentCalls is handled by ServiceBusProcessor automatically
+                // Only 5 messages will be processed concurrently
+                await ProcessPaymentAsync(paymentRequest, args, stoppingToken);
+
+                // Complete the message after successful processing
+                await args.CompleteMessageAsync(args.Message, stoppingToken);
+
+                _logger.LogInformation("Payment {PaymentId} message completed successfully", paymentId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing payment {PaymentId} from Service Bus", paymentId);
+
+                // Check if payment was cancelled (client disconnected)
+                if (paymentRequest != null && _statusService.IsPaymentCancelled(paymentRequest.PaymentId))
                 {
-                    try
-                    {
-                        await ProcessPaymentAsync(paymentRequest, stoppingToken);
-                    }
-                    finally
-                    {
-                        // Release semaphore slot so next payment can start
-                        _processingSemaphore.Release();
-                    }
-                }, stoppingToken);
+                    _logger.LogWarning(
+                        "Payment {PaymentId} was cancelled (client disconnected). Abandoning message.",
+                        paymentId);
+                    
+                    // Abandon the message - Service Bus will redeliver it after lock timeout
+                    // Or it will go to dead letter queue if max delivery count is reached
+                    await args.AbandonMessageAsync(args.Message, cancellationToken: stoppingToken);
+                }
+                else
+                {
+                    // For other errors, abandon the message for retry
+                    await args.AbandonMessageAsync(args.Message, cancellationToken: stoppingToken);
+                }
+
+                throw; // Re-throw to let processor handle it
             }
         }
 
-        private async Task ProcessPaymentAsync(PaymentRequest request, CancellationToken stoppingToken)
+        private async Task ProcessPaymentAsync(
+            PaymentRequest request,
+            ProcessMessageEventArgs args,
+            CancellationToken stoppingToken)
         {
             var paymentId = request.PaymentId;
-            
+
             try
             {
                 // Check if client disconnected before we even start
@@ -87,8 +158,6 @@ namespace PaymentRateLimiter.Core.Services
                     return;
                 }
 
-                // Note: Semaphore slot was already acquired in ExecuteAsync before task creation
-                // This ensures we don't create unlimited tasks waiting for slots
                 _logger.LogInformation("Payment {PaymentId} starting processing. Amount: {Amount}", 
                     paymentId, request.Amount);
 
@@ -186,20 +255,14 @@ namespace PaymentRateLimiter.Core.Services
                 }
                 finally
                 {
-                    // Semaphore is released in ExecuteAsync's Task.Run finally block
                     _logger.LogDebug("Payment {PaymentId} processing completed", paymentId);
                 }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Unexpected error processing payment {PaymentId}", paymentId);
+                throw;
             }
-        }
-
-        public override void Dispose()
-        {
-            _processingSemaphore?.Dispose();
-            base.Dispose();
         }
     }
 }

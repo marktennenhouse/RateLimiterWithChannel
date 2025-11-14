@@ -313,11 +313,89 @@ public async Task ProcessPaymentStream([FromBody] PaymentRequestDto dto)
 
 - ✅ **Azure Service Bus Integration**: Persistent queue, scales across servers
 - ✅ **Rate Limiting**: MaxConcurrentCalls (default: 5, configurable) - automatically enforced by ServiceBusProcessor
-- ✅ **Real-Time Status Updates**: Subscribe via channels
+- ✅ **Real-Time Status Updates**: Subscribe via per-payment channels
+- ✅ **Per-Payment Channel Isolation**: Each payment gets its own dedicated channel for secure, isolated status updates
 - ✅ **Client Disconnection Handling**: Prevents processing abandoned payments
 - ✅ **Thread-Safe**: Safe for concurrent use
 - ✅ **Automatic Cleanup**: Service Bus handles message lifecycle
 - ✅ **Monitoring**: GetStatistics() for active/disconnected/total counts
+
+## Per-Payment Channel Isolation Architecture
+
+### How Status Channels Work
+
+The `PaymentStatusService` uses a `ConcurrentDictionary<string, Channel<PaymentStatus>>` to store channels in memory. **Each payment gets its own dedicated channel**, ensuring that status updates are delivered only to the specific client that initiated that payment.
+
+**Key Concept**: The `ConcurrentDictionary` holds each channel in memory, and getting a reader based on the `PaymentId` allows the code to send messages to **ONLY a single specific listener**.
+
+### One-to-One Mapping
+
+```
+1 Payment = 1 Channel = 1 Client Connection
+```
+
+**Example Flow:**
+
+1. **Client 1** requests payment (PaymentId: "abc-123"):
+   ```csharp
+   _statusService.RegisterPayment(paymentRequest); // Creates Channel A
+   var reader = _statusService.GetStatusReader("abc-123"); // Gets Channel A's reader
+   ```
+
+2. **Client 2** requests payment (PaymentId: "def-456"):
+   ```csharp
+   _statusService.RegisterPayment(paymentRequest); // Creates Channel B
+   var reader = _statusService.GetStatusReader("def-456"); // Gets Channel B's reader
+   ```
+
+3. **Worker** processes Payment "abc-123":
+   ```csharp
+   await _statusService.SendStatusAsync("abc-123", status);
+   // Writes to Channel A ONLY → Client 1 receives message ✅
+   // Client 2 receives nothing ✅
+   ```
+
+4. **Worker** processes Payment "def-456":
+   ```csharp
+   await _statusService.SendStatusAsync("def-456", status);
+   // Writes to Channel B ONLY → Client 2 receives message ✅
+   // Client 1 receives nothing ✅
+   ```
+
+### Memory Structure
+
+```csharp
+ConcurrentDictionary<string, Channel<PaymentStatus>> _statusChannels
+
+// Example in-memory state:
+{
+  "abc-123" → Channel A  (for Payment A)
+  "def-456" → Channel B  (for Payment B)
+  "ghi-789" → Channel C  (for Payment C)
+  ...
+}
+```
+
+### Why Per-Payment Channels?
+
+**Benefits:**
+- ✅ **Isolation**: Each payment's status updates are completely isolated
+- ✅ **Privacy**: Clients only see their own payment status (no cross-contamination)
+- ✅ **Simplicity**: No filtering needed - each channel is dedicated to one payment
+- ✅ **Concurrency**: Multiple payments can process simultaneously without interference
+- ✅ **Cleanup**: When a payment completes, only its channel is cleaned up
+
+**If we used a single shared channel:**
+- ❌ Clients would see other payments' statuses (privacy issue)
+- ❌ Clients would need to filter messages by PaymentId (overhead)
+- ❌ One client's disconnection could affect others (no isolation)
+
+### Thread Safety
+
+The `ConcurrentDictionary` provides thread-safe access, allowing:
+- Multiple worker threads to write status updates concurrently
+- Multiple client threads to read from their respective channels
+- Safe cleanup operations without race conditions
 
 ## How Rate Limiting Works (MaxConcurrentCalls)
 

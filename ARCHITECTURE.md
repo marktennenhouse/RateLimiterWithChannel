@@ -123,6 +123,86 @@ Status message object sent from worker to client:
 - `CleanupStalePayments(threshold)`: Periodic cleanup of orphaned records
 - `GetStatistics()`: Monitoring endpoint data
 
+##### Per-Payment Channel Isolation Architecture
+
+**Why Each Payment Gets Its Own Channel**
+
+The `PaymentStatusService` uses a `ConcurrentDictionary<string, Channel<PaymentStatus>>` to store channels in memory, where each `PaymentId` maps to its own dedicated channel. This design ensures **message isolation** - status updates for a specific payment are delivered only to the client that initiated that payment.
+
+**How It Works:**
+
+1. **Channel Creation (Per Payment)**:
+   ```csharp
+   // When a payment is registered:
+   RegisterPayment(paymentRequest) 
+   → Creates Channel<PaymentStatus> for PaymentId "abc-123"
+   → Stores in ConcurrentDictionary: { "abc-123" → Channel A }
+   ```
+
+2. **Worker Sends Status (PaymentId-Based Routing)**:
+   ```csharp
+   // Worker processes payment "abc-123":
+   SendStatusAsync("abc-123", status)
+   → Looks up channel in dictionary: _statusChannels["abc-123"]
+   → Writes to Channel A ONLY
+   → Message goes to ONLY the listener for PaymentId "abc-123"
+   ```
+
+3. **Client Reads Status (PaymentId-Based Reader)**:
+   ```csharp
+   // Client gets reader for their specific payment:
+   GetStatusReader("abc-123")
+   → Returns Channel A's reader
+   → Client reads ONLY messages for PaymentId "abc-123"
+   ```
+
+**Key Design Principles:**
+
+- **One-to-One Mapping**: 1 Payment = 1 Channel = 1 Client Connection
+- **Memory Storage**: `ConcurrentDictionary` holds all channels in memory, keyed by `PaymentId`
+- **Isolated Communication**: Getting a reader based on `PaymentId` ensures messages are sent to ONLY the specific listener for that payment
+- **Thread-Safe**: `ConcurrentDictionary` provides thread-safe access from multiple worker threads
+- **Privacy & Security**: Clients only see status updates for their own payment, not others
+
+**Example with Multiple Concurrent Payments:**
+
+```
+ConcurrentDictionary State:
+{
+  "abc-123" → Channel A  (Payment A)
+  "def-456" → Channel B  (Payment B)
+  "ghi-789" → Channel C  (Payment C)
+}
+
+Worker Thread 1: SendStatusAsync("abc-123", status)
+  → Writes to Channel A
+  → Client 1 (Payment A) receives message ✅
+  → Client 2 (Payment B) receives nothing ✅
+  → Client 3 (Payment C) receives nothing ✅
+
+Worker Thread 2: SendStatusAsync("def-456", status)
+  → Writes to Channel B
+  → Client 1 (Payment A) receives nothing ✅
+  → Client 2 (Payment B) receives message ✅
+  → Client 3 (Payment C) receives nothing ✅
+```
+
+**Why Not a Single Shared Channel?**
+
+If all payments shared one channel:
+- ❌ **Privacy Issue**: Clients would see other payments' statuses
+- ❌ **Filtering Overhead**: Clients would need to filter messages by PaymentId
+- ❌ **No Isolation**: One client's disconnection could affect others
+- ❌ **Complexity**: Would require message routing logic
+
+**Benefits of Per-Payment Channels:**
+
+- ✅ **Isolation**: Each payment's status updates are completely isolated
+- ✅ **Privacy**: Clients only see their own payment status
+- ✅ **Simplicity**: No filtering needed - each channel is dedicated to one payment
+- ✅ **Concurrency**: Multiple payments can process simultaneously without interference
+- ✅ **Cleanup**: When a payment completes, only its channel is cleaned up
+
 #### PaymentProcessorWorker (BackgroundService)
 Rate-limited background processor using Azure Service Bus:
 - Uses `ServiceBusProcessor` to receive messages from Service Bus queue
